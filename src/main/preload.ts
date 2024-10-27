@@ -22,6 +22,14 @@ const electronHandler = {
       ipcRenderer.once(channel, (_event, ...args) => func(...args));
     },
   },
+
+  getInstalledVersions: () => ipcRenderer.invoke('get-installed-versions'),
+  installVersion: (version: string) => ipcRenderer.invoke('install-version', version),
+  removeVersion: (version: string) => ipcRenderer.invoke('remove-version', version),
+  useVersion: (version: string) => ipcRenderer.invoke('use-version', version),
+  recommendVersions: () => ipcRenderer.invoke('get-recommended-versions'),
+  setProxy: (proxyUrl: string, proxyPort: string) => ipcRenderer.invoke('set-proxy', proxyUrl, proxyPort),
+  getProxy: () => ipcRenderer.invoke('get-proxy'),
 };
 
 contextBridge.exposeInMainWorld('electron', electronHandler);

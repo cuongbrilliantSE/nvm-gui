@@ -1,19 +1,12 @@
-/* eslint global-require: off, no-console: off, promise/always-return: off */
-
-/**
- * This module executes inside of electron's main process. You can start
- * electron renderer process from here and communicate with the other processes
- * through IPC.
- *
- * When running `npm run build` or `npm run build:main`, this file is compiled to
- * `./src/main.js` using webpack. This gives us some performance wins.
- */
 import path from 'path';
-import { app, BrowserWindow, shell, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, shell } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
+import { execSync } from 'child_process';
+import fetch from 'node-fetch';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 class AppUpdater {
   constructor() {
@@ -30,6 +23,142 @@ ipcMain.on('ipc-example', async (event, arg) => {
   console.log(msgTemplate(arg));
   event.reply('ipc-example', msgTemplate('pong'));
 });
+
+ipcMain.handle('get-installed-versions', async () => {
+  const installedVersions = await getInstalledNodeVersions();
+  const currentNodeVersion = getCurrentNodeVersion();
+  return installedVersions.map(version => ({
+    version,
+    active: version === currentNodeVersion,
+  }));
+});
+
+const getInstalledNodeVersions = async () => {
+  const fs = require('fs');
+  const nvmDir = process.env.NVM_HOME;
+
+  if (!nvmDir) {
+    console.error('NVM_HOME environment variable is not set.');
+    return [];
+  }
+
+  try {
+    const versions = await fs.promises.readdir(nvmDir);
+    return versions.filter(version => version.startsWith('v')).map(version => version.replace('v', ''));
+  } catch (error) {
+    console.error('Error reading Node.js versions:', error);
+    return [];
+  }
+};
+
+const getCurrentNodeVersion = () => {
+  let version = execSync('node -v').toString().trim();
+  version = version.replace(/^v/, '');
+  return version
+};
+
+ipcMain.handle('use-version', async (event, version: string) => {
+  try {
+    console.log(version);
+    execSync(`nvm use ${version}`);
+    return true;
+  } catch (error) {
+    console.error('Error using version:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('install-version', async (event, version: string) => {
+  try {
+    execSync(`nvm install ${version}`);
+    return { success: true, message: `Node.js version ${version} installed successfully.` };
+  } catch (error) {
+    console.error('Error installing version:', error);
+    return { success: false, message: 'Failed to install Node.js version. Please check logs.' };
+  }
+});
+
+ipcMain.handle('remove-version', async (event, version: string) => {
+  try {
+    execSync(`nvm uninstall ${version}`);
+    console.log(`Node.js version ${version} uninstalled successfully.`);
+    return { success: true, message: `Node.js version ${version} removed successfully.` };
+  } catch (error) {
+    console.error(`Failed to uninstall Node.js version ${version}:`, error);
+    return { success: false, message: `Failed to remove Node.js version ${version}.` };
+  }
+});
+
+ipcMain.handle('get-proxy', async () => {
+  return getProxy();
+});
+
+
+const getProxy = async () => {
+  const conf = process.platform == 'win32' ? 'settings.txt' : 'nvm.conf';
+  const fs = require('fs');
+  if (process.platform === 'win32') {
+    const settingsFile = path.join(process.env.NVM_HOME || '', conf);
+
+    try {
+      if (fs.existsSync(settingsFile)) {
+        const settingsContent = await fs.promises.readFile(settingsFile, 'utf-8');
+        return parseConfigFile(settingsContent);
+      } else {
+        console.error('settings.txt file not found.');
+        return { proxyUrl: '', proxyPort: '' };
+      }
+    } catch (error) {
+      console.error('Error reading settings.txt:', error);
+      return { proxyUrl: '', proxyPort: '' };
+    }
+  } else {
+    console.log('Not running on Windows.');
+    return { proxyUrl: '', proxyPort: '' };
+  }
+
+}
+
+
+
+// Function to parse the config file and extract proxy settings
+const parseConfigFile = (content: string) => {
+  const proxyMatch = content.match(/proxy:\s*(http:\/\/.+:\d+)/);
+
+  if (!proxyMatch) {
+    return { proxyUrl: '', proxyPort: '' };
+  }
+
+  const proxyUrlWithProtocol = proxyMatch[1];
+  const url = new URL(proxyUrlWithProtocol);
+
+  const proxyUrl = url.hostname;
+  const proxyPort = url.port;
+
+  return { proxyUrl, proxyPort };
+};
+
+ipcMain.handle('set-proxy', (event, proxyUrl, proxyPort) => {
+  execSync(`nvm proxy http://${proxyUrl}:${proxyPort}`);
+  return { success: true, message: `Proxy ${proxyUrl}:${proxyPort} successfully.` };
+});
+
+ipcMain.handle('get-recommended-versions', async (event, version: string) => {
+  try {
+    const { proxyUrl, proxyPort } = await getProxy();
+    const proxyAgent = new HttpsProxyAgent(`http://${proxyUrl}:${proxyPort}`);
+    const response = await fetch('https://nodejs.org/download/release/index.json', {
+      agent: proxyAgent
+    });
+    const data = await response.json();
+    return { success: true, data }
+  } catch (error) {
+    console.error('Error when fetch version:', error);
+    return { success: false, message: 'Failed to fetch recommended versions.' };
+  }
+});
+
+
 
 if (process.env.NODE_ENV === 'production') {
   const sourceMapSupport = require('source-map-support');
@@ -71,19 +200,21 @@ const createWindow = async () => {
 
   mainWindow = new BrowserWindow({
     show: false,
-    width: 1024,
-    height: 728,
+    width: 900,
+    height: 650,
     icon: getAssetPath('icon.png'),
     webPreferences: {
       preload: app.isPackaged
         ? path.join(__dirname, 'preload.js')
         : path.join(__dirname, '../../.erb/dll/preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
     },
   });
 
   mainWindow.loadURL(resolveHtmlPath('index.html'));
 
-  mainWindow.on('ready-to-show', () => {
+  mainWindow.on('ready-to-show', async () => {
     if (!mainWindow) {
       throw new Error('"mainWindow" is not defined');
     }
@@ -101,14 +232,13 @@ const createWindow = async () => {
   const menuBuilder = new MenuBuilder(mainWindow);
   menuBuilder.buildMenu();
 
-  // Open urls in the user's browser
+  // Open URLs in the user's browser
   mainWindow.webContents.setWindowOpenHandler((edata) => {
     shell.openExternal(edata.url);
     return { action: 'deny' };
   });
 
-  // Remove this if your app does not use auto updates
-  // eslint-disable-next-line
+  // Auto-updates
   new AppUpdater();
 };
 
@@ -117,7 +247,7 @@ const createWindow = async () => {
  */
 
 app.on('window-all-closed', () => {
-  // Respect the OSX convention of having the application in memory even
+  // Respect the macOS convention of having the application in memory even
   // after all windows have been closed
   if (process.platform !== 'darwin') {
     app.quit();
@@ -129,8 +259,7 @@ app
   .then(() => {
     createWindow();
     app.on('activate', () => {
-      // On macOS it's common to re-create a window in the app when the
-      // dock icon is clicked and there are no other windows open.
+      // On macOS, recreate a window when the dock icon is clicked
       if (mainWindow === null) createWindow();
     });
   })
